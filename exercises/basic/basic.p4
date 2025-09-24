@@ -13,6 +13,19 @@ typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
 
+header tcp_t {
+    bit<16> srcPort;
+    bit<16> dstPort;
+    bit<32> seqNo;
+    bit<32> ackNo;
+    bit<4>  dataOffset;
+    bit<4>  res;
+    bit<8>  flags;
+    bit<16> window;
+    bit<16> checksum;
+    bit<16> urgentPtr;
+}
+
 header ethernet_t {
     macAddr_t dstAddr;
     macAddr_t srcAddr;
@@ -36,11 +49,13 @@ header ipv4_t {
 
 struct metadata {
     /* empty */
+    bit<32> ecmp_select;
 }
 
 struct headers {
     ethernet_t   ethernet;
     ipv4_t       ipv4;
+    tcp_t        tcp;
 }
 
 /*************************************************************************
@@ -54,6 +69,27 @@ parser MyParser(packet_in packet,
 
     state start {
         /* TODO: add parser logic */
+        transition parse_ethernet;
+    }
+
+    state parse_ethernet {
+        packet.extract(hdr.ethernet);
+        transition select (hdr.ethernet.etherType) {
+            TYPE_IPV4: parse_ipv4;
+            default: accept;
+        }
+    }
+
+    state parse_ipv4 {
+        packet.extract(hdr.ipv4);
+            transition select (hdr.ipv4.protocol) {
+            6: parse_tcp; // TCP protocol number
+            default: accept;
+        }
+    }
+
+    state parse_tcp {
+        packet.extract(hdr.tcp);
         transition accept;
     }
 }
@@ -79,41 +115,59 @@ control MyIngress(inout headers hdr,
         mark_to_drop(standard_metadata);
     }
 
-    action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
-        /*
-            Action function for forwarding IPv4 packets.
+    action set_ecmp_select(bit<32> ecmp_base, bit<32> ecmp_count) {
+        bit<32> hv;
+        hash(hv, HashAlgorithm.crc32, 0w32, 
+            { hdr.ipv4.srcAddr, hdr.ipv4.dstAddr, hdr.ipv4.protocol, hdr.tcp.srcPort }, ecmp_count);
+        meta.ecmp_select = ecmp_base + hv;
+    }
 
-            This function is responsible for forwarding IPv4 packets to the specified
-            destination MAC address and egress port.
+    action set_nhop(macAddr_t nhop_dmac, egressSpec_t port) {
+        hdr.ethernet.dstAddr = nhop_dmac;
+        standard_metadata.egress_spec = port;
+        if (hdr.ipv4.isValid()) { hdr.ipv4.ttl = hdr.ipv4.ttl - 1; }
+    }
 
-            Parameters:
-            - dstAddr: Destination MAC address of the packet.
-            - port: Egress port where the packet should be forwarded.
-
-            TODO: Implement the logic for forwarding the IPv4 packet based on the
-            destination MAC address and egress port.
-        */
+    action ipv4_forward(macAddr_t dmac, egressSpec_t port) {
+        hdr.ethernet.dstAddr = dmac;
+        standard_metadata.egress_spec = port;
+        if (hdr.ipv4.isValid()) { hdr.ipv4.ttl = hdr.ipv4.ttl - 1; }
     }
 
     table ipv4_lpm {
-        key = {
-            hdr.ipv4.dstAddr: lpm;
-        }
-        actions = {
-            ipv4_forward;
-            drop;
-            NoAction;
-        }
+        key = { hdr.ipv4.dstAddr : lpm; }
+        actions = { ipv4_forward; drop; }
         size = 1024;
-        default_action = NoAction();
+        default_action = drop();
     }
 
-    apply {
-        /* TODO: fix ingress control logic
-         *  - ipv4_lpm should be applied only when IPv4 header is valid
-         */
-        ipv4_lpm.apply();
+
+    table ecmp_group {
+        key = { hdr.ipv4.dstAddr : lpm; }
+        actions = { set_ecmp_select; drop; }
+        size = 1024;
+        default_action = drop();
     }
+
+    table ecmp_nhop {
+        key = { meta.ecmp_select : exact; }
+        actions = { set_nhop; drop; }
+        size = 64; // 至少能放你要的成員數（這裡 2）
+        default_action = drop();
+    }
+
+
+    apply {
+        if (!hdr.ipv4.isValid()) { return; }   // 只有 IPv4 才處理
+
+        bool ecmp_hit = ecmp_group.apply().hit;
+        if (ecmp_hit) {
+            ecmp_nhop.apply();                 // 依 ecmp_select 選成員 → 設 (dmac, port)
+        } else {
+            ipv4_lpm.apply();                  // 目的導向（S2/S3/S4 全靠這張）
+        }
+    }
+
 }
 
 /*************************************************************************
@@ -170,6 +224,8 @@ control MyDeparser(packet_out packet, in headers hdr) {
         TODO: Implement the logic for constructing the output packet by appending
         headers based on the input headers.
         */
+        packet.emit(hdr.ethernet);
+        packet.emit(hdr.ipv4);
     }
 }
 

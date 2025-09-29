@@ -78,6 +78,10 @@ struct headers {
 // Upper bound on ports for your target; 512 is safe on bmv2/simple_switch
 const bit<32> NUM_PORTS = 512;
 
+// number of buckets for per-flow state (power of 2 preferred)
+const bit <32> FLOWLET_BUCKETS = 4096;
+register<bit<32>>(FLOWLET_BUCKETS) fl_last_ts;
+register<bit<32>>(FLOWLET_BUCKETS) fl_choice;
 
 register<bit<64>>(NUM_PORTS) bytes_per_port;
 register<bit<32>>(1)  packet_seq;
@@ -196,7 +200,54 @@ control MyIngress(inout headers hdr,
         hash(hv, HashAlgorithm.crc32, (bit<32>)0, { seq }, ecmp_count);
 
         meta.ecmp_select = ecmp_base + hv;
+    }
+
+    // Map the 5-tuple to a stable bucket index [0..FLOWLET_BUCKETS-1]
+    action flow_to_bucket(out bit<32> idx) {
+        bit<32> hv;
+        bit<32> sp = hdr.tcp.isValid() ? (bit<32>)hdr.tcp.srcPort : 32w0;
+        bit<32> dp = hdr.tcp.isValid() ? (bit<32>)hdr.tcp.dstPort : 32w0;
+        hash(hv, HashAlgorithm.crc32, 32w0,
+            { hdr.ipv4.srcAddr, hdr.ipv4.dstAddr, hdr.ipv4.protocol, sp, dp },
+            FLOWLET_BUCKETS);
+        idx = hv;
+    }
+
+
+    // Pick a member 0..ecmp_count-1 when a new flowlet starts
+    action pick_member(out bit<32> member, bit<32> ecmp_count) {
+        bit<32> seq; bit<32> hv;
+        packet_seq.read(seq, 0);
+        packet_seq.write(0, seq + 1);
+        hash(hv, HashAlgorithm.crc32, 32w0, { seq }, ecmp_count);
+        member = hv;
+    }
+
+
+    // FLOWLET selection: reuse pinned member if gap <= timeout, else start new flowlet
+    action set_flowlet_select(bit<32> ecmp_base, bit<32> ecmp_count, bit<32> timeout_us) {
+        bit<32> bkt; flow_to_bucket(bkt);
+
+        bit<32> last; bit<32> pinned; bit<32> chosen;
+        fl_last_ts.read(last,  bkt);
+        fl_choice.read(pinned, bkt);
+
+        // v1model: ingress_global_timestamp is 48 bits (microseconds). Cast to 32 safely.
+        bit<48> ts48 = (bit<48>) standard_metadata.ingress_global_timestamp;
+        bit<32> now  = (bit<32>) ts48;
+        bit<32> gap  = now - last;   // small timeouts: wrap-safe
+
+        if (gap > timeout_us || gap == 0 || pinned >= ecmp_count) {
+            pick_member(chosen, ecmp_count);   // <- swapped args
+            fl_choice.write(bkt, chosen);
+            fl_last_ts.write(bkt,  now);
+        } else {
+            chosen = pinned;
         }
+
+
+        meta.ecmp_select = ecmp_base + chosen;
+    }
 
     table ipv4_lpm {
         key = { hdr.ipv4.dstAddr : lpm; }
@@ -207,8 +258,7 @@ control MyIngress(inout headers hdr,
 
     table ecmp_group {
         key = { hdr.ipv4.dstAddr : lpm; }
-        // actions = { set_ecmp_select; drop; }
-        actions = { set_rr_select; drop; }
+        actions = { set_flowlet_select; set_rr_select; set_ecmp_select; drop; }
         size = 1024;
         default_action = drop();
     }

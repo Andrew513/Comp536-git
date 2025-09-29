@@ -77,7 +77,10 @@ struct headers {
 
 // Upper bound on ports for your target; 512 is safe on bmv2/simple_switch
 const bit<32> NUM_PORTS = 512;
+
+
 register<bit<64>>(NUM_PORTS) bytes_per_port;
+register<bit<32>>(1)  packet_seq;
 
 /*************************************************************************
 *********************** P A R S E R  ***********************************
@@ -185,6 +188,16 @@ control MyIngress(inout headers hdr,
         standard_metadata.egress_spec = standard_metadata.ingress_port;
     }
 
+    action set_rr_select(bit<32> ecmp_base, bit<32> ecmp_count) {
+        bit<32> hv;
+        bit<32> seq;
+        packet_seq.read(seq, 0);
+        packet_seq.write(0, seq + 1);
+        hash(hv, HashAlgorithm.crc32, (bit<32>)0, { seq }, ecmp_count);
+
+        meta.ecmp_select = ecmp_base + hv;
+        }
+
     table ipv4_lpm {
         key = { hdr.ipv4.dstAddr : lpm; }
         actions = { ipv4_forward; drop; }
@@ -194,7 +207,8 @@ control MyIngress(inout headers hdr,
 
     table ecmp_group {
         key = { hdr.ipv4.dstAddr : lpm; }
-        actions = { set_ecmp_select; drop; }
+        // actions = { set_ecmp_select; drop; }
+        actions = { set_rr_select; drop; }
         size = 1024;
         default_action = drop();
     }

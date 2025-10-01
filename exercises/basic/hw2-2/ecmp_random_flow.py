@@ -30,36 +30,19 @@ def query_counter(port, iface, dst_ip):
 def rand_ip(prefix="10.0.1."):
     return prefix + str(random.randint(2,254))
 
-from scapy.all import get_if_addr
-
-def send_flows(dst_ip, src_ip, iface, flows, sizes, min_ppf=5, max_ppf=12, inter_pkt_gap=0.0):
-    """
-    Send 'flows' distinct flows. Each flow has between min_ppf and max_ppf packets.
-    All packets within a flow share the same 5-tuple (src_ip, dst_ip, sport, dport, proto=TCP),
-    but payload SIZE varies packet-to-packet.
-    """
+def send_flows(dst_ip, iface, flows, sizes):
     src_mac = get_if_hwaddr(iface)
     total_wire = 0
-    for f in range(flows):
-        sport = random.randint(1024, 65535)
-        dport = random.randint(1024, 65535)
-        ppf   = random.randint(min_ppf, max_ppf)
-
-        print(f"\nFlow {f+1}: {src_ip}:{sport} -> {dst_ip}:{dport}  packets={ppf}")
-        for n in range(ppf):
-            size = min(random.choice(sizes), MAX_TCP_PL)  # vary size within the flow
-            pkt = (Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
-                   IP(src=src_ip, dst=dst_ip, ttl=64) /
-                   TCP(sport=sport, dport=dport, flags=0x10) /  # ACK bit to look “mid-flow”
-                   Raw(bytes(random.getrandbits(8) for _ in range(size))))
-            sendp(pkt, iface=iface, verbose=False)
-            total_wire += len(bytes(pkt))
-            if inter_pkt_gap:
-                time.sleep(inter_pkt_gap)
-        print(f"  sent {ppf} packets (sizes varied)")
-
+    for i in range(flows):
+        size = min(random.choice(sizes), MAX_TCP_PL)
+        pkt = (Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")/
+               IP(src=rand_ip(), dst=dst_ip)/
+               TCP(sport=random.randint(1024,65535), dport=random.randint(1024,65535))/
+               Raw(bytes(random.getrandbits(8) for _ in range(size))))
+        sendp(pkt, iface=iface, verbose=False)
+        total_wire += len(bytes(pkt))
+        print(f"Sent flow {i+1}: {pkt[IP].src}:{pkt[TCP].sport} -> {dst_ip}:{pkt[TCP].dport}, size={size}")
     return total_wire
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -72,16 +55,14 @@ def main():
     args = ap.parse_args()
 
     iface = args.iface or pick_iface()
-    src_ip = get_if_addr(iface)         # <- fixed host source IP
     upper, lower = args.ports
 
     # 1) Baseline counters
     upper0 = query_counter(upper, iface, args.mon_ip)
     lower0 = query_counter(lower, iface, args.mon_ip)
 
-    # 2) Generate flows (multiple packets per flow, varying sizes)
-    total_wire = send_flows(args.dst_ip, src_ip, iface, args.flows, args.sizes,
-                            min_ppf=5, max_ppf=12, inter_pkt_gap=0.0)
+    # 2) Generate flows
+    total_wire = send_flows(args.dst_ip, iface, args.flows, args.sizes)
 
     # 3) Read counters again
     upper1 = query_counter(upper, iface, args.mon_ip)
